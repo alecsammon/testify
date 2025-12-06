@@ -874,10 +874,13 @@ func FunctionalOptions(values ...interface{}) *FunctionalOptionsArgument {
 // not the argument is matched by the expectation fixture function.
 type argumentMatcher struct {
 	// fn is a function which accepts one argument, and returns a bool.
-	fn reflect.Value
+	fn  reflect.Value
+	typ reflect.Type
+
+	errs []string
 }
 
-func (f argumentMatcher) Matches(argument interface{}) bool {
+func (f *argumentMatcher) Matches(argument interface{}) bool {
 	expectType := f.fn.Type().In(0)
 	expectTypeNilSupported := false
 	switch expectType.Kind() {
@@ -898,28 +901,53 @@ func (f argumentMatcher) Matches(argument interface{}) bool {
 	}
 	if argType == nil || argType.AssignableTo(expectType) {
 		result := f.fn.Call([]reflect.Value{arg})
-		return result[0].Bool()
+
+		if f.typ.Out(0).Kind() == reflect.Bool {
+			return result[0].Bool()
+		}
+
+		err := result[0].Interface().(error)
+		if err != nil {
+			f.errs = append(f.errs, err.Error())
+		}
+
+		return err == nil
 	}
 	return false
 }
 
-func (f argumentMatcher) String() string {
-	return fmt.Sprintf("func(%s) bool", f.fn.Type().In(0).String())
+func (f *argumentMatcher) String() string {
+	outputError := "custom matcher: \n"
+	for i, err := range f.errs {
+		outputError += fmt.Sprintf("\t[%d] - %s\n", i, err)
+	}
+
+	return outputError
 }
 
 // MatchedBy can be used to match a mock call based on only certain properties
-// from a complex struct or some calculation. It takes a function that will be
-// evaluated with the called argument and will return true when there's a match
-// and false otherwise.
+// from a complex struct or some calculation.
+//
+// It takes a function that will be evaluated with the called argument.
+// The return of the function can take two forms:
+//  1. bool: return true when there's a match and false otherwise.
+//  2. error: return nil when there's a match and an error otherwise.
 //
 // Example:
 //
 //	m.On("Do", MatchedBy(func(req *http.Request) bool { return req.Host == "example.com" }))
 //
+//	m.On("Do", MatchedBy(func(req *http.Request) error {
+//		if req.Host != "example.com" {
+//			return fmt.Errorf("expected host to be example.com but got %s", req.Host)
+//		}
+//		return nil
+//	}))
+//
 // fn must be a function accepting a single argument (of the expected type)
-// which returns a bool. If fn doesn't match the required signature,
-// MatchedBy() panics.
-func MatchedBy(fn interface{}) argumentMatcher {
+// which returns a bool, or returns an error. If fn doesn't match the required
+// signature, MatchedBy() panics.
+func MatchedBy(fn interface{}) *argumentMatcher {
 	fnType := reflect.TypeOf(fn)
 
 	if fnType.Kind() != reflect.Func {
@@ -928,11 +956,15 @@ func MatchedBy(fn interface{}) argumentMatcher {
 	if fnType.NumIn() != 1 {
 		panic(fmt.Sprintf("assert: arguments: %s does not take exactly one argument", fn))
 	}
-	if fnType.NumOut() != 1 || fnType.Out(0).Kind() != reflect.Bool {
-		panic(fmt.Sprintf("assert: arguments: %s does not return a bool", fn))
+	if fnType.NumOut() != 1 {
+		panic(fmt.Sprintf("assert: arguments: %s does not return exactly one value", fn))
 	}
 
-	return argumentMatcher{fn: reflect.ValueOf(fn)}
+	if fnType.Out(0).Kind() != reflect.Bool && !fnType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		panic(fmt.Sprintf("assert: arguments: %s does not return a bool or error", fn))
+	}
+
+	return &argumentMatcher{fn: reflect.ValueOf(fn), typ: fnType}
 }
 
 // Get Returns the argument at the specified index.
@@ -988,7 +1020,7 @@ func (args Arguments) Diff(objects []interface{}) (string, int) {
 			expectedFmt = fmt.Sprintf("(%[1]T=%[1]v)", expected)
 		}
 
-		if matcher, ok := expected.(argumentMatcher); ok {
+		if matcher, ok := expected.(*argumentMatcher); ok {
 			var matches bool
 			func() {
 				defer func() {
